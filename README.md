@@ -140,3 +140,164 @@ The course itself is never deleted by either action.
 
 The statistics query uses `count(e.id)`, not `count(*)`, so a course with no
 matching enrollment receives a count of zero after the `LEFT JOIN`.
+
+## Constraint violation log
+
+The following cases demonstrate that correctness does not depend only on the
+application. PostgreSQL rejects invalid writes even when SQL is executed directly.
+
+| Test case | SQLSTATE | Constraint or column | Suggested API status |
+|---|---:|---|---:|
+| Course title is `NULL` | `23502` | `courses.title` (`NOT NULL`) | `422` |
+| Course credits are `0` | `23514` | `courses_credits_check` | `422` |
+| Course likes are `-1` | `23514` | `courses_likes_check` | `422` |
+| Student name has one character | `23514` | `students_name_check` | `422` |
+| Student email already exists | `23505` | `students_email_key` | `409` |
+| Course ID already exists | `23505` | `courses_pkey` | `409` |
+| Enrollment pair already exists | `23505` | `enrollments_course_id_student_id_key` | `409` |
+| Course ID does not exist | `23503` | `enrollments_course_id_fkey` | `404` |
+| Student ID does not exist | `23503` | `enrollments_student_id_fkey` | `404` |
+| Delete a course that still has enrollments | `23503` on PostgreSQL 16/17 (`23001` may be used in PostgreSQL 18) | `enrollments_course_id_fkey` | `409` |
+
+Deleting seeded student Daniyar Bekov demonstrates `ON DELETE CASCADE`:
+
+```sql
+BEGIN;
+SELECT count(*) FROM enrollments; -- 6
+DELETE FROM students WHERE email = 'daniyar@example.com';
+SELECT count(*) FROM enrollments; -- 3
+ROLLBACK;
+SELECT count(*) FROM enrollments; -- 6 again
+```
+
+### Why validation is duplicated in Pydantic and PostgreSQL
+
+Pydantic gives API clients fast, readable `422 Unprocessable Entity` responses
+before a query is sent. Database constraints remain essential because data can
+also be written by scripts, migrations, administrative tools, other services, or
+concurrent requests. Pydantic improves the interface; PostgreSQL is the final
+authority for stored data. A backend should translate known SQLSTATE values such
+as unique (`23505`), foreign-key (`23503`), and check (`23514`) violations into
+stable HTTP responses instead of returning an unexplained server error.
+
+## Index experiment
+
+`experiments/idx_data.sql` adds 500 courses, 20,000 students, and 50,000
+enrollments. Use a separate database so the lab seed counts remain unchanged:
+
+```sql
+CREATE DATABASE course_catalog_idx OWNER catalog_app;
+```
+
+```bash
+psql -v ON_ERROR_STOP=1 -U catalog_app -d course_catalog_idx -f schema.sql
+psql -v ON_ERROR_STOP=1 -U catalog_app -d course_catalog_idx -f experiments/idx_data.sql
+```
+
+For the before measurement, remove the explicit foreign-key index and execute the
+same query several times:
+
+```sql
+DROP INDEX enrollments_student_id_idx;
+ANALYZE enrollments;
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT * FROM enrollments WHERE student_id = 12345;
+```
+
+A representative plan scans the complete table:
+
+```text
+Seq Scan on enrollments
+  Filter: (student_id = 12345)
+  Rows Removed by Filter: about 49,997
+Execution Time: about 3.6 ms
+```
+
+Create the index and repeat the exact query:
+
+```sql
+CREATE INDEX enrollments_student_id_idx ON enrollments (student_id);
+ANALYZE enrollments;
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT * FROM enrollments WHERE student_id = 12345;
+```
+
+A representative indexed plan is:
+
+```text
+Bitmap Heap Scan on enrollments
+  Recheck Cond: (student_id = 12345)
+  -> Bitmap Index Scan on enrollments_student_id_idx
+       Index Cond: (student_id = 12345)
+Execution Time: a few hundredths of a millisecond
+```
+
+Exact costs and timings depend on PostgreSQL version, hardware, caching, and data
+distribution. The important change is from examining roughly 50,000 rows to
+locating only matching index entries.
+
+| Measurement | Plan | Rows inspected | Typical time |
+|---|---|---:|---:|
+| Before index | Sequential scan | about 50,000 | about 3.6 ms |
+| After index | Bitmap index/heap scan | matching rows | hundredths of a millisecond |
+
+PostgreSQL automatically indexes primary keys and unique constraints, but it does
+not automatically index the referencing side of a foreign key. Therefore:
+
+- `students.email` uses the index created by `UNIQUE`;
+- `enrollments.course_id` can use the unique `(course_id, student_id)` index
+  because `course_id` is its first column;
+- `enrollments.student_id` needs its own index because it is the second column of
+  that composite index;
+- a query on the six-row `courses` table may still choose a sequential scan even
+  though a primary-key index exists, because reading the small table is cheaper.
+
+The student index speeds up enrollment listings and helps PostgreSQL locate the
+dependent rows that must be removed during a cascaded student deletion.
+
+## Transaction experiment
+
+### Failed transaction is atomic
+
+```sql
+BEGIN;
+
+INSERT INTO students (name, email)
+VALUES ('Transaction Student', 'transaction@example.com');
+
+INSERT INTO enrollments (course_id, student_id)
+VALUES ('course-does-not-exist',
+        (SELECT id FROM students WHERE email = 'transaction@example.com'));
+
+-- PostgreSQL now reports that the current transaction is aborted.
+SELECT * FROM students WHERE email = 'transaction@example.com';
+
+ROLLBACK;
+
+-- Returns zero rows: the first successful insert was rolled back too.
+SELECT * FROM students WHERE email = 'transaction@example.com';
+```
+
+The foreign-key failure aborts the transaction. Until `ROLLBACK`, PostgreSQL
+refuses subsequent statements. No partial result survives.
+
+### Visibility between two connections
+
+In connection A, start a transaction and insert a student plus an enrollment, but
+do not commit yet. A query from connection B returns zero matching rows because
+the default `READ COMMITTED` isolation level hides uncommitted changes. After
+connection A runs `COMMIT`, connection B sees both rows. The student and their
+enrollment become visible as one atomic change, never as a half-completed state.
+
+## Self-review checklist
+
+- [x] Three related tables with appropriate primary and foreign keys
+- [x] Required `NOT NULL`, `DEFAULT`, `CHECK`, and `UNIQUE` constraints
+- [x] `RESTRICT` for course deletion and `CASCADE` for student deletion
+- [x] Seed data contains 6 courses, 3 students, and 6 enrollments
+- [x] API-oriented queries include joins, aggregation, pagination, and bonuses
+- [x] Example writes in `queries.sql` end with `ROLLBACK`
+- [x] Foreign-key index experiment includes before/after methodology
+- [x] Transaction atomicity and visibility are documented
+- [x] Mermaid ER diagram and design decisions are documented
+- [x] Repository contains at least six meaningful commits
