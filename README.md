@@ -13,7 +13,12 @@ course-catalog-db/
 ├── queries.sql
 ├── README.md
 └── experiments/
-    └── idx_data.sql
+    ├── idx_data.sql
+    ├── norm_demo.sql
+    ├── norm_to_schema.sql
+    ├── lost_update.sql
+    ├── sql_injection.sql
+    └── email_constraint.sql
 ```
 
 ## Requirements
@@ -151,7 +156,7 @@ All listed SQLSTATE and constraint names were verified on PostgreSQL 16.14.
 |---|---:|---|---:|
 | Course title is `NULL` | `23502` | `courses.title` (`NOT NULL`) | `422` |
 | Course credits are `0` | `23514` | `courses_credits_check` | `422` |
-| Course likes are `-1` | `23514` | `courses_likes_check` | `422` |
+| Course likes are `-1` | `23514` | `courses_likes_check` | `500` |
 | Student name has one character | `23514` | `students_name_check` | `422` |
 | Student email already exists | `23505` | `students_email_key` | `409` |
 | Course ID already exists | `23505` | `courses_pkey` | `409` |
@@ -202,18 +207,18 @@ same query several times:
 DROP INDEX enrollments_student_id_idx;
 ANALYZE enrollments;
 EXPLAIN (ANALYZE, BUFFERS)
-SELECT * FROM enrollments WHERE student_id = 12345;
+SELECT * FROM enrollments WHERE student_id = 777;
 ```
 
 The measured plan without the index scanned the complete table:
 
 ```text
 Seq Scan on enrollments  (cost=0.00..1042.00 rows=3 width=34)
-  (actual time=0.793..3.036 rows=2 loops=1)
-  Filter: (student_id = 12345)
-  Rows Removed by Filter: 49998
+  (actual time=0.048..2.312 rows=3 loops=1)
+  Filter: (student_id = 777)
+  Rows Removed by Filter: 49997
   Buffers: shared hit=417
-Execution Time: 3.075 ms
+Execution Time: 2.361 ms
 ```
 
 Create the index and repeat the exact query:
@@ -222,33 +227,33 @@ Create the index and repeat the exact query:
 CREATE INDEX enrollments_student_id_idx ON enrollments (student_id);
 ANALYZE enrollments;
 EXPLAIN (ANALYZE, BUFFERS)
-SELECT * FROM enrollments WHERE student_id = 12345;
+SELECT * FROM enrollments WHERE student_id = 777;
 ```
 
 After creating the index, the second (cache-warm) measured plan was:
 
 ```text
 Bitmap Heap Scan on enrollments  (cost=4.31..15.59 rows=3 width=34)
-  (actual time=0.037..0.045 rows=2 loops=1)
-  Recheck Cond: (student_id = 12345)
-  Heap Blocks: exact=2
+  (actual time=0.031..0.043 rows=3 loops=1)
+  Recheck Cond: (student_id = 777)
+  Heap Blocks: exact=3
   -> Bitmap Index Scan on enrollments_student_id_idx
-       (actual time=0.027..0.027 rows=2 loops=1)
-       Index Cond: (student_id = 12345)
+       (actual time=0.024..0.024 rows=3 loops=1)
+       Index Cond: (student_id = 777)
 Execution Time: 0.101 ms
 ```
 
 These measurements were taken on PostgreSQL 16.14 in the lab Docker container.
-The first cold indexed execution took `0.608 ms`; the repeated warm execution took
+The first cold indexed execution took `1.324 ms`; the repeated warm execution took
 `0.101 ms`. Exact timings depend on hardware, caching, and data distribution. The
-important change is from examining 50,000 rows to locating two matching index
+important change is from examining 50,000 rows to locating three matching index
 entries.
 
 | Measurement | Plan | Rows inspected | Measured time |
 |---|---|---:|---:|
-| Before index, warm run | Sequential scan | 50,000 | 3.075 ms |
-| After index, cold run | Bitmap index/heap scan | 2 matches | 0.608 ms |
-| After index, warm run | Bitmap index/heap scan | 2 matches | 0.101 ms |
+| Before index, warm run | Sequential scan | 50,000 | 2.361 ms |
+| After index, cold run | Bitmap index/heap scan | 3 matches | 1.324 ms |
+| After index, warm run | Bitmap index/heap scan | 3 matches | 0.101 ms |
 
 PostgreSQL automatically indexes primary keys and unique constraints, but it does
 not automatically index the referencing side of a foreign key. Therefore:
@@ -290,7 +295,9 @@ SELECT * FROM students WHERE email = 'transaction@example.com';
 The foreign-key failure aborts the transaction. Until `ROLLBACK`, PostgreSQL
 refuses subsequent statements. No partial result survives. In the executed test,
 the final query returned `0` rows for `transaction@example.com`; the database
-still contained exactly 6 courses, 3 students, and 6 enrollments.
+still contained exactly 6 courses, 3 students, and 6 enrollments. Without the
+transaction, the first insert would remain committed after the second insert
+failed, leaving a student with no enrollment.
 
 ### Visibility between two connections
 
@@ -303,15 +310,97 @@ The executed two-connection test returned `0 students / 0 enrollments` before
 `COMMIT` and `1 student / 1 enrollment` after `COMMIT`. The test student was then
 removed, returning the main database to the required 6/3/6 row counts.
 
-## Self-review checklist
+## Bonus tasks
 
-- [x] Three related tables with appropriate primary and foreign keys
-- [x] Required `NOT NULL`, `DEFAULT`, `CHECK`, and `UNIQUE` constraints
-- [x] `RESTRICT` for course deletion and `CASCADE` for student deletion
-- [x] Seed data contains 6 courses, 3 students, and 6 enrollments
-- [x] API-oriented queries include joins, aggregation, pagination, and bonuses
-- [x] Example writes in `queries.sql` end with `ROLLBACK`
-- [x] Foreign-key index experiment includes before/after methodology
-- [x] Transaction atomicity and visibility are documented
-- [x] Mermaid ER diagram and design decisions are documented
-- [x] Repository contains at least six meaningful commits
+### Bonus 1: normalization anomalies
+
+`experiments/norm_demo.sql` creates a deliberately flat `registrations` table
+and demonstrates all three anomalies inside transactions that are rolled back:
+
+- update anomaly: one course obtains two different titles;
+- delete anomaly: deleting the only enrollment also loses the course facts;
+- insert anomaly: storing a course with no enrollment requires a row with an
+  empty student.
+
+Run the flat-table experiment in a throwaway database, then migrate its data into
+the normalized schema:
+
+```bash
+createdb -U catalog_app -O catalog_app norm_demo
+psql -v ON_ERROR_STOP=1 -U catalog_app -d norm_demo -f experiments/norm_demo.sql
+psql -v ON_ERROR_STOP=1 -U catalog_app -d norm_demo -f schema.sql
+psql -v ON_ERROR_STOP=1 -U catalog_app -d norm_demo -f experiments/norm_to_schema.sql
+```
+
+The normalized result contains 3 students, 3 courses, and 6 enrollments. The
+other three catalog courses could not be recovered because a flat registration
+table has nowhere to store a course with no enrollment.
+
+### Bonus 2: lost update and row lock
+
+`experiments/lost_update.sql` compares two clients writing the same computed
+value with two atomic increments. The first approach finishes at 12 instead of
+13, so one like is lost. `SET likes = likes + 1` finishes at 13 because PostgreSQL
+computes from the current row value while holding a row lock. The file ends with
+`ROLLBACK` and leaves the seed unchanged.
+
+To see the lock, set `api-design` back to 11. In console A, leave this transaction
+open:
+
+```sql
+BEGIN;
+UPDATE courses
+SET likes = likes + 1
+WHERE id = 'api-design'
+RETURNING likes;
+```
+
+Run the same `UPDATE` in console B. It waits. Run `COMMIT` in A; B then completes
+and returns 13. Reset the teaching data with:
+
+```sql
+UPDATE courses SET likes = 11 WHERE id = 'api-design';
+```
+
+### Bonus 3: parameters prevent SQL injection
+
+`experiments/sql_injection.sql` first runs the vulnerable condition
+`id = 'x' OR '1' = '1'`, which returns all six courses. It then passes the attack
+text to a prepared statement as one `text` parameter and gets zero rows. A
+parameter is parsed only as a value, not as executable SQL syntax.
+
+### Bonus 4: two additional queries
+
+Queries 7 and 8 in `queries.sql` are the two bonus queries. Query 7 uses
+`LEFT JOIN` plus `WHERE e.id IS NULL` and returns the three courses with no
+enrollments. Query 8 groups enrollments by student and uses
+`HAVING count(*) > 1`; `HAVING` filters groups after aggregation, whereas `WHERE`
+filters individual rows before aggregation.
+
+### Bonus 5: adding a rule to a live table
+
+`experiments/email_constraint.sql` removes and re-adds the explicitly named
+`students_email_format` constraint with `ALTER TABLE`, without recreating the
+table. PostgreSQL checks all existing rows before accepting a new constraint.
+The same rule is also present in `schema.sql`, so a database created from scratch
+has the final schema.
+
+After running the experiment file, this insert must fail with
+`students_email_format`:
+
+```sql
+INSERT INTO students (name, email)
+VALUES ('Test User', 'no-at-sign');
+```
+
+## Self-review against the checklist
+
+| What to check | Result |
+|---|---|
+| Keys | Yes — every table has a primary key; `enrollments` has both required foreign keys. |
+| Types | Yes — slugs use `text`, generated IDs use `bigint`, and moments use `timestamptz`. |
+| Required values | Yes — all domain-required columns are `NOT NULL`. |
+| Constraints | Yes — domain rules use `CHECK` and `UNIQUE`, including the enrollment pair. |
+| Deletion | Yes — course deletion is `RESTRICT`; student deletion is `CASCADE`. |
+| Normalization | Yes — student and course facts are stored once; the junction table stores only relationships. |
+| Indexes and names | Yes — names use snake_case and the uncovered `student_id` foreign key has an explicit index. |
